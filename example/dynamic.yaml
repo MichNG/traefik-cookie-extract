@@ -1,0 +1,57 @@
+# dynamic.yaml
+#
+# Cookie extraction with this plugin only: no third-party middleware is involved.
+#
+# Routers:
+#   /bearer  the default translation: the value is prefixed with "Bearer " and
+#            written to the Authorization header (what most backends expect)
+#   /custom  a custom header name and an empty prefix: the raw cookie value
+#   /quiet   logLevel: off - the middleware is silent, the header is still set
+http:
+  routers:
+    bearer:
+      rule: "Host(`localhost`) && PathPrefix(`/bearer`)"
+      entryPoints: [web]
+      middlewares: [cookie-bearer]
+      service: target
+    custom:
+      rule: "Host(`localhost`) && PathPrefix(`/custom`)"
+      entryPoints: [web]
+      middlewares: [cookie-custom]
+      service: target
+    quiet:
+      rule: "Host(`localhost`) && PathPrefix(`/quiet`)"
+      entryPoints: [web]
+      middlewares: [cookie-quiet]
+      service: target
+
+  middlewares:
+    cookie-bearer:
+      plugin:
+        cookieExtract:
+          cookieName: access_token
+          headerNameForCookieValue: Authorization
+          cookieValuePrefix: "Bearer "
+          logLevel: debug
+
+    # The token is expected as X-Access-Token, without any prefix.
+    cookie-custom:
+      plugin:
+        cookieExtract:
+          cookieName: access_token
+          headerNameForCookieValue: X-Access-Token
+          cookieValuePrefix: ""
+          logLevel: info
+
+    # Nothing is logged for this middleware: useful for a high traffic router.
+    cookie-quiet:
+      plugin:
+        cookieExtract:
+          cookieName: access_token
+          logLevel: off
+
+  services:
+    target:
+      loadBalancer:
+        servers:
+          - url: http://target

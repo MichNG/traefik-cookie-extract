@@ -1,0 +1,29 @@
+# traefik.yaml
+#
+# Static configuration used by docker-compose.yaml: the plugin is mounted as a
+# local plugin (see the volume in docker-compose.yaml) under the name
+# cookieExtract.
+#
+# log.level is DEBUG because the plugin reports its messages at the Traefik debug
+# level: with the default INFO level they are not visible at all.
+
+entryPoints:
+  web:
+    address: ":8000"
+
+providers:
+  file:
+    filename: "/etc/traefik/dynamic.yaml"
+
+api:
+  dashboard: true
+  insecure: true  # development only
+
+log:
+  level: DEBUG
+  format: common
+
+experimental:
+  localPlugins:
+    cookieExtract:
+      moduleName: github.com/MichNG/traefik-cookie-extract

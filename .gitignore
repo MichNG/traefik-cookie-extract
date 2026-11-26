@@ -1,0 +1,12 @@
+# Go caches kept inside the repository (see run-tests.sh)
+.gocache/
+.gomodcache/
+.gopath/
+.gotmp/
+coverage.txt
+cover.html
+
+# end to end verification artifacts (see e2e.sh)
+.e2e/
+
+.DS_Store

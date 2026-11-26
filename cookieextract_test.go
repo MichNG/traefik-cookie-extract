@@ -1,0 +1,440 @@
+package traefik_cookie_extract
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mitchellh/mapstructure"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testCookieName  = "test_access_token"
+	testCookieValue = "pretend_to_be_auth_token"
+	testHeaderName  = "Authorization"
+	testValuePrefix = "Bearer "
+)
+
+var (
+	minCookie = http.Cookie{Name: testCookieName, Value: testCookieValue}
+	maxCookie = http.Cookie{
+		Name:     testCookieName,
+		Value:    testCookieValue,
+		Path:     "/path/to",
+		Domain:   "example.com",
+		Expires:  time.Now(),
+		MaxAge:   5,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	}
+	expiredCookie  = http.Cookie{Name: testCookieName, Value: testCookieValue, MaxAge: 0}
+	garbageCookie  = http.Cookie{Name: "some_cookie_garbage", Value: "bla bla foo bar"}
+	anotherCookie  = http.Cookie{Name: "session", Value: "abc123"}
+	emptyValue     = http.Cookie{Name: testCookieName, Value: ""}
+	wantHeaderLine = testValuePrefix + testCookieValue
+)
+
+func TestCreateConfig(t *testing.T) {
+	cfg := CreateConfig()
+
+	require.NotNil(t, cfg)
+	assert.Empty(t, cfg.CookieName)
+	assert.Equal(t, defaultHeaderName, cfg.HeaderNameForCookieValue)
+	assert.Equal(t, defaultValuePrefix, cfg.CookieValuePrefix)
+	assert.Equal(t, LogLevelInfo, cfg.LogLevel)
+}
+
+// TestConfigDecoding decodes the configuration exactly like the Traefik plugin
+// loader does (mapstructure with WeaklyTypedInput over the CreateConfig result),
+// so that a decoder tag or a default value mistake is caught by the tests.
+func TestConfigDecoding(t *testing.T) {
+	t.Run("the defaults are kept for the absent fields", func(t *testing.T) {
+		cfg := decodeConfig(t, map[string]interface{}{"cookieName": testCookieName})
+
+		assert.Equal(t, testCookieName, cfg.CookieName)
+		assert.Equal(t, defaultHeaderName, cfg.HeaderNameForCookieValue)
+		assert.Equal(t, defaultValuePrefix, cfg.CookieValuePrefix)
+		assert.Equal(t, LogLevelInfo, cfg.LogLevel)
+	})
+
+	t.Run("every field is decoded", func(t *testing.T) {
+		cfg := decodeConfig(t, map[string]interface{}{
+			"cookieName":               testCookieName,
+			"headerNameForCookieValue": "X-Access-Token",
+			"cookieValuePrefix":        "",
+			"logLevel":                 LogLevelDebug,
+		})
+
+		assert.Equal(t, testCookieName, cfg.CookieName)
+		assert.Equal(t, "X-Access-Token", cfg.HeaderNameForCookieValue)
+		assert.Empty(t, cfg.CookieValuePrefix, "an explicit empty prefix must be preserved")
+		assert.Equal(t, LogLevelDebug, cfg.LogLevel)
+	})
+}
+
+func TestNewRejectsAnInvalidConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{name: "nil configuration", cfg: nil, want: "empty configuration"},
+		{name: "missing cookieName", cfg: &Config{}, want: "cookieName is required"},
+		{
+			name: "cookieName with a space",
+			cfg:  &Config{CookieName: "bad name"},
+			want: `invalid cookieName "bad name"`,
+		},
+		{
+			name: "cookieName with a separator",
+			cfg:  &Config{CookieName: "bad;name"},
+			want: "invalid cookieName",
+		},
+		{
+			name: "cookieName with a control character",
+			cfg:  &Config{CookieName: "bad\x7fname"},
+			want: "control characters",
+		},
+		{
+			name: "empty headerNameForCookieValue",
+			cfg:  &Config{CookieName: testCookieName, HeaderNameForCookieValue: ""},
+			want: "headerNameForCookieValue must not be empty",
+		},
+		{
+			name: "unsupported logLevel",
+			cfg:  &Config{CookieName: testCookieName, LogLevel: "verbose"},
+			want: `unsupported logLevel "verbose", expected one of: off, warn, info, debug`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, err := New(context.Background(), nextHandler(&http.Header{}), test.cfg, "test")
+
+			require.Error(t, err)
+			assert.Nil(t, handler)
+			assert.Contains(t, err.Error(), test.want)
+		})
+	}
+}
+
+func TestNewAcceptsTheValidLogLevels(t *testing.T) {
+	for _, level := range []string{"", LogLevelOff, LogLevelWarn, LogLevelInfo, LogLevelDebug, "DEBUG", " Info "} {
+		t.Run(level, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.LogLevel = level
+
+			handler, err := New(context.Background(), nextHandler(&http.Header{}), cfg, "test")
+
+			require.NoError(t, err)
+			assert.NotNil(t, handler)
+		})
+	}
+}
+
+func TestServeHTTPSetsTheHeaderFromTheCookie(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     func(*Config)
+		cookies []*http.Cookie
+		want    string
+	}{
+		{
+			name:    "the minimal cookie",
+			cookies: []*http.Cookie{&minCookie},
+			want:    wantHeaderLine,
+		},
+		{
+			name:    "the full cookie",
+			cookies: []*http.Cookie{&maxCookie},
+			want:    wantHeaderLine,
+		},
+		{
+			name:    "an expired cookie",
+			cookies: []*http.Cookie{&expiredCookie},
+			want:    wantHeaderLine,
+		},
+		{
+			name:    "an empty value",
+			cookies: []*http.Cookie{&emptyValue},
+			want:    testValuePrefix,
+		},
+		{
+			name:    "no cookie",
+			cookies: nil,
+			want:    "",
+		},
+		{
+			name:    "another cookie only",
+			cookies: []*http.Cookie{&anotherCookie, &garbageCookie},
+			want:    "",
+		},
+		{
+			name:    "the cookie next to others",
+			cookies: []*http.Cookie{&anotherCookie, &minCookie, &garbageCookie},
+			want:    wantHeaderLine,
+		},
+		{
+			name:    "a custom header name",
+			cfg:     func(c *Config) { c.HeaderNameForCookieValue = "X-Access-Token" },
+			cookies: []*http.Cookie{&minCookie},
+			want:    wantHeaderLine,
+		},
+		{
+			name:    "an empty prefix",
+			cfg:     func(c *Config) { c.CookieValuePrefix = "" },
+			cookies: []*http.Cookie{&minCookie},
+			want:    testCookieValue,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig()
+			if test.cfg != nil {
+				test.cfg(cfg)
+			}
+
+			// The request messages are not asserted here: they are dropped to
+			// keep the test output clean.
+			captureStdout(t)
+
+			handler, seen := newMiddleware(t, cfg)
+			rec := send(handler, test.cookies...)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, test.want, (*seen).Get(cfg.HeaderNameForCookieValue))
+		})
+	}
+}
+
+// TestMissingCookieIsNotSpammed is the regression test of the reported issue: a
+// request without the cookie is an expected case, it must not be warned about on
+// every request, while a wrong cookieName must stay visible.
+func TestMissingCookieIsNotSpammed(t *testing.T) {
+	const requests = 10
+
+	t.Run("a single warning per middleware instance", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.LogLevel = LogLevelWarn
+
+		handler, seen := newMiddleware(t, cfg)
+		stdout := captureStdout(t)
+
+		for i := 0; i < requests; i++ {
+			send(handler)
+		}
+
+		assert.Equal(t, 1, strings.Count(stdout(), "WARN  no"), "expected a single warning for %d requests", requests)
+		assert.Empty(t, (*seen).Get(testHeaderName))
+	})
+
+	t.Run("the debug detail is throttled", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.LogLevel = LogLevelDebug
+
+		handler, _ := newMiddleware(t, cfg)
+		stdout := captureStdout(t)
+
+		for i := 0; i < requests; i++ {
+			send(handler)
+		}
+
+		out := stdout()
+		assert.Equal(t, 1, strings.Count(out, "WARN  no"), "expected a single warning for %d requests", requests)
+		assert.Equal(t, 1, strings.Count(out, "DEBUG no"), "expected the throttled debug detail, got: %q", out)
+	})
+}
+
+func TestLogLevelsOnRequests(t *testing.T) {
+	tests := []struct {
+		name       string
+		level      string
+		withCookie bool
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name:       "off logs nothing",
+			level:      LogLevelOff,
+			withCookie: true,
+			wantAbsent: []string{"DEBUG", "INFO ", "WARN "},
+		},
+		{
+			name:       "off logs nothing without the cookie either",
+			level:      LogLevelOff,
+			wantAbsent: []string{"DEBUG", "INFO ", "WARN "},
+		},
+		{
+			name:       "warn logs the missing cookie",
+			level:      LogLevelWarn,
+			want:       []string{`WARN  no "test_access_token" cookie in the request`},
+			wantAbsent: []string{"DEBUG", "INFO "},
+		},
+		{
+			name:       "warn does not log an extracted cookie",
+			level:      LogLevelWarn,
+			withCookie: true,
+			wantAbsent: []string{"DEBUG", "INFO ", "WARN "},
+		},
+		{
+			name:       "info logs the extracted cookie",
+			level:      LogLevelInfo,
+			withCookie: true,
+			want:       []string{"INFO  set the Authorization header from the \"test_access_token\" cookie"},
+			wantAbsent: []string{"DEBUG", "WARN "},
+		},
+		{
+			name:       "debug logs the extraction and the detail",
+			level:      LogLevelDebug,
+			withCookie: true,
+			want: []string{
+				"DEBUG serving GET /",
+				"INFO  set the Authorization header",
+			},
+			wantAbsent: []string{"WARN "},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.LogLevel = test.level
+
+			handler, _ := newMiddleware(t, cfg)
+			stdout := captureStdout(t)
+
+			if test.withCookie {
+				send(handler, &minCookie)
+			} else {
+				send(handler)
+			}
+
+			out := stdout()
+			for _, want := range test.want {
+				assert.Contains(t, out, want)
+			}
+
+			for _, unwanted := range test.wantAbsent {
+				assert.NotContains(t, out, unwanted)
+			}
+		})
+	}
+}
+
+// TestLogLevelDoesNotLeakBetweenInstances checks that a verbose middleware does
+// not turn on the logs of the other middleware instances.
+func TestLogLevelDoesNotLeakBetweenInstances(t *testing.T) {
+	verboseCfg := testConfig()
+	verboseCfg.LogLevel = LogLevelDebug
+	quietCfg := testConfig()
+	quietCfg.LogLevel = LogLevelInfo
+
+	verbose, _ := newMiddleware(t, verboseCfg)
+	verboseOut := captureStdout(t)
+
+	send(verbose, &minCookie)
+	assert.Contains(t, verboseOut(), "DEBUG serving GET /")
+
+	quiet, _ := newMiddleware(t, quietCfg)
+	quietOut := captureStdout(t)
+
+	send(quiet, &minCookie)
+	out := quietOut()
+	assert.Contains(t, out, "INFO  set the Authorization header")
+	assert.NotContains(t, out, "DEBUG", "the quiet middleware must not log the debug messages")
+}
+
+// TestTheCookieValueIsNeverLogged keeps a credential out of the Traefik log.
+func TestTheCookieValueIsNeverLogged(t *testing.T) {
+	cfg := testConfig()
+	cfg.LogLevel = LogLevelDebug
+
+	handler, _ := newMiddleware(t, cfg)
+	stdout := captureStdout(t)
+
+	send(handler, &minCookie)
+
+	assert.NotContains(t, stdout(), testCookieValue)
+}
+
+// TestNothingIsWrittenToTheErrorLevel checks that the informational messages are
+// not reported at the Traefik error level: the configuration errors are returned
+// to Traefik, which reports them itself.
+func TestNothingIsWrittenToTheErrorLevel(t *testing.T) {
+	cfg := testConfig()
+	cfg.LogLevel = LogLevelDebug
+
+	handler, _ := newMiddleware(t, cfg)
+	stderr := captureStderr(t)
+
+	send(handler, &minCookie)
+	send(handler)
+
+	assert.Empty(t, stderr())
+}
+
+// testConfig is a valid configuration with a small log level.
+func testConfig() *Config {
+	cfg := CreateConfig()
+	cfg.CookieName = testCookieName
+
+	return cfg
+}
+
+// decodeConfig decodes a raw configuration like the Traefik plugin loader does.
+func decodeConfig(t *testing.T, raw map[string]interface{}) *Config {
+	t.Helper()
+
+	cfg := CreateConfig()
+
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		DecodeHook:       mapstructure.StringToSliceHookFunc(","),
+		WeaklyTypedInput: true,
+		Result:           cfg,
+	})
+	require.NoError(t, err)
+	require.NoError(t, decoder.Decode(raw))
+
+	return cfg
+}
+
+// newMiddleware creates the middleware under test, with a backend recording the
+// headers it receives.
+func newMiddleware(t *testing.T, cfg *Config) (http.Handler, *http.Header) {
+	t.Helper()
+
+	seen := &http.Header{}
+
+	handler, err := New(context.Background(), nextHandler(seen), cfg, "test-middleware")
+	require.NoError(t, err)
+
+	return handler, seen
+}
+
+// nextHandler returns the backend, recording the headers of the requests it sees.
+func nextHandler(seen *http.Header) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		*seen = req.Header.Clone()
+		rw.WriteHeader(http.StatusOK)
+	})
+}
+
+// send drives one request carrying the given cookies through the middleware.
+func send(handler http.Handler, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	return rec
+}

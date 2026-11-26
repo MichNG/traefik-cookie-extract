@@ -1,0 +1,16 @@
+services:
+  reverse-proxy:
+    image: traefik:v3.5
+    command: --api.insecure=true --providers.file.filename=/etc/traefik/dynamic.yaml
+    ports:
+      - "8000:8000"
+      - "8080:8080"
+    volumes:
+      - ./example/traefik.yaml:/etc/traefik/traefik.yaml:ro
+      - ./example/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
+      - .:/plugins-local/src/github.com/MichNG/traefik-cookie-extract/
+
+  target:
+    image: traefik/whoami
+    ports:
+      - "80"

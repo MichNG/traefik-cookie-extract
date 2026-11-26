@@ -1,0 +1,19 @@
+services:
+  traefik:
+    image: traefik:${TRAEFIK_VERSION:-v3.8.0}
+    command:
+      - --log.level=${TRAEFIK_LOG_LEVEL:-DEBUG}
+      - --log.filePath=/var/log/traefik/traefik.log
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
+      - --entrypoints.web.address=:80
+      - --experimental.localplugins.cookieExtract.modulename=github.com/MichNG/traefik-cookie-extract
+    ports:
+      - "${HOST_PORT:-8099}:80"
+    volumes:
+      # Only the runtime sources are mounted, so that the check also proves that
+      # the plugin needs nothing but the Go standard library.
+      - ./.e2e/plugin:/plugins-local/src/github.com/MichNG/traefik-cookie-extract:ro
+      - ./.e2e/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
+      - ./.e2e/logs:/var/log/traefik
+  whoami:
+    image: traefik/whoami

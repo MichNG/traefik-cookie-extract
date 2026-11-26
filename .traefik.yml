@@ -1,0 +1,13 @@
+displayName: Traefik Cookie Extract
+type: middleware
+iconPath: .assets/cookie.png
+
+import: github.com/MichNG/traefik-cookie-extract
+
+summary: 'Traefik Cookie Extract: takes the value of a cookie (typically an access token) and puts it in a header (Authorization by default), with an optional value prefix. A request without the cookie is an expected case: the header is left untouched, and the plugin never floods the logs.'
+
+testData:
+  cookieName: test_access_token
+  headerNameForCookieValue: Authorization
+  cookieValuePrefix: 'Bearer '
+  logLevel: info
