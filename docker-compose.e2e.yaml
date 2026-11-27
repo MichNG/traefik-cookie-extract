@@ -11,9 +11,10 @@ services:
       - "${HOST_PORT:-8099}:80"
     volumes:
       # Only the runtime sources are mounted, so that the check also proves that
-      # the plugin needs nothing but the Go standard library.
-      - ./.e2e/plugin:/plugins-local/src/github.com/MichNG/traefik-cookie-extract:ro
-      - ./.e2e/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
-      - ./.e2e/logs:/var/log/traefik
+      # the plugin needs nothing but the Go standard library. e2e.sh exports the
+      # three paths (one scratch directory per run).
+      - ${PLUGIN_DIR:-./.e2e/plugin}:/plugins-local/src/github.com/MichNG/traefik-cookie-extract:ro
+      - ${DYNAMIC_FILE:-./.e2e/dynamic.yaml}:/etc/traefik/dynamic.yaml:ro
+      - ${LOGS_DIR:-./.e2e/logs}:/var/log/traefik
   whoami:
     image: traefik/whoami

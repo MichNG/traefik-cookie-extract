@@ -16,7 +16,8 @@ cover:
 # drives a few requests through it. The Go caches of the tool are kept inside
 # tools/yaegicheck, so that the target also works in restricted environments.
 yaegi-check:
-	@cd tools/yaegicheck && GOCACHE="$$PWD/.gocache" GOTMPDIR="$$PWD/.gotmp" \
+	@cd tools/yaegicheck && mkdir -p .gocache .gotmp .gomodcache .gopath && \
+		GOCACHE="$$PWD/.gocache" GOTMPDIR="$$PWD/.gotmp" \
 		GOMODCACHE="$$PWD/.gomodcache" GOPATH="$$PWD/.gopath" GOFLAGS="-mod=mod" go run .
 
 # Traefik + whoami stand, with the plugin mounted as a local plugin.

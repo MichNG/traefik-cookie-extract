@@ -174,6 +174,7 @@ as a local plugin and serves three routers (`/bearer`, `/custom`, `/quiet`).
 ./run-tests.sh -race      # gofmt + go vet + go test (works inside restricted sandboxes)
 make yaegi-check          # loads the plugin with yaegi v0.16.1 (as Traefik does)
 ./e2e.sh                  # end to end check of the logging behaviour on a real Traefik
+TRAEFIK_VERSION=v3.6 ./e2e.sh   # against another release (CI runs the v3.5-v3.8 matrix)
 docker compose up -d      # the stand of example/
 ```
 

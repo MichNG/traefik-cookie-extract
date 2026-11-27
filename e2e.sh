@@ -21,18 +21,27 @@
 # Environment:
 #   TRAEFIK_VERSION   Traefik image tag, defaults to v3.8.0
 #   PORT              host port published to the Traefik web entry point, defaults to 8099
+#   PROJECT           docker compose project name, allows concurrent runs (CI matrix)
+#   WORK              scratch directory, defaults to .e2e/<project>
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PROJECT=cookie-extract-e2e
+PROJECT=${PROJECT:-cookie-extract-e2e}
 PORT=${PORT:-8099}
 TRAEFIK_VERSION=${TRAEFIK_VERSION:-v3.8.0}
 COMPOSE="docker compose -p ${PROJECT} -f docker-compose.e2e.yaml"
 COOKIE_NAME=access_token
 COOKIE_VALUE=secret-token
 EXPECTED_HEADER="Authorization: Bearer ${COOKIE_VALUE}"
-WORK=.e2e
+WORK=${WORK:-.e2e/${PROJECT}}
+
+# The compose file mounts these three paths; exporting them allows several
+# instances of the script to run at the same time (one scratch directory each).
+export PLUGIN_DIR="$WORK/plugin"
+export DYNAMIC_FILE="$WORK/dynamic.yaml"
+export LOGS_DIR="$WORK/logs"
+
 TRACEFILE="$WORK/logs/traefik.log"
 OUTPUTFILE="$WORK/logs/process-output.log"
 RESPONSEFILE="$WORK/responses.txt"
@@ -68,15 +77,15 @@ check_count() { # file pattern(ERE) expected description
 # Go standard library, and the caches of the repository must not be shipped to the
 # Docker daemon.
 prepare_plugin() {
-  rm -rf "$WORK/plugin"
-  mkdir -p "$WORK/plugin"
-  cp .traefik.yml go.mod cookieextract.go logger.go "$WORK/plugin/"
+  rm -rf "$PLUGIN_DIR"
+  mkdir -p "$PLUGIN_DIR"
+  cp .traefik.yml go.mod cookieextract.go logger.go "$PLUGIN_DIR/"
 }
 
 write_configs() { # plugin_log_level traefik_log_level
   local plugin_level=${1} traefik_level=${2}
 
-  mkdir -p "$WORK/logs"
+  mkdir -p "$LOGS_DIR"
 
   # Every scenario gets a fresh Traefik: a running instance keeps writing to the
   # inode of a log file removed underneath it, and a configuration change is
@@ -84,7 +93,7 @@ write_configs() { # plugin_log_level traefik_log_level
   ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
   rm -f "$TRACEFILE" "$OUTPUTFILE" "$RESPONSEFILE"
 
-  cat >"$WORK/dynamic.yaml" <<EOF
+  cat >"$DYNAMIC_FILE" <<EOF
 http:
   routers:
     extract:
@@ -223,7 +232,7 @@ scenario_invalid_configuration() {
 
   log "scenario: an unmatchable cookieName is rejected with a clear error"
   start_traefik info DEBUG false || return
-  sed -i.bak "s/cookieName: ${COOKIE_NAME}/cookieName: 'bad name'/" "$WORK/dynamic.yaml" && rm -f "$WORK/dynamic.yaml.bak"
+  sed -i.bak "s/cookieName: ${COOKIE_NAME}/cookieName: 'bad name'/" "$DYNAMIC_FILE" && rm -f "$DYNAMIC_FILE.bak"
   ${COMPOSE} restart traefik >/dev/null
   sleep 6
   collect_output

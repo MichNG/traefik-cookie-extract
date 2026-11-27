@@ -36,12 +36,23 @@ jobs:
         run: go run .
 
   e2e:
+    name: e2e (Traefik ${{ matrix.traefik }})
     runs-on: ubuntu-latest
+    strategy:
+      # Every supported Traefik release is checked: the plugin depends on the
+      # interpreter channel Traefik redirects into its own logger, and on the
+      # local plugin loading.
+      fail-fast: false
+      matrix:
+        traefik: ['v3.5', 'v3.6', 'v3.7', 'v3.8']
+    env:
+      TRAEFIK_VERSION: ${{ matrix.traefik }}
     steps:
       - uses: actions/checkout@v4
 
       # Loads the plugin in a real Traefik (local plugin) and checks the logging
       # behaviour: messages in the Traefik log file, nothing on the process
-      # output (journald, /var/log/messages), logLevel: off is silent.
-      - name: end to end verification (Traefik + whoami)
+      # output (journald, /var/log/messages), logLevel: off is silent, and an
+      # invalid configuration is rejected with an explicit error.
+      - name: end to end verification (Traefik ${{ matrix.traefik }})
         run: ./e2e.sh
