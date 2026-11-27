@@ -6,7 +6,10 @@
 coverage.txt
 cover.html
 
-# end to end verification artifacts (see e2e.sh)
+# end to end verification artifacts (see e2e.sh, hack/ci, hack/bench)
 .e2e/
+.stand/
+.bench/
+artifacts/
 
 .DS_Store

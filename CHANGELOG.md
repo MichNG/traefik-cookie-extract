@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.0 (unreleased)
+
+### Added
+
+* the docker stands of the nightly pipeline: `hack/ci/integration.sh` (log
+  routing and levels, spoofing, JSON cookie, hostile values, reload, invalid
+  configurations), `hack/ci/chaos.sh` (backend and Traefik restarts, a reload
+  storm, hostile requests and a spam phase, all under load) and
+  `hack/bench/run.sh` (a stdlib load generator, throughput and latency
+  percentiles per case, and the plugin log volume under load);
+* `.github/workflows/nightly.yml`: unit + yaegi, the integration stand, the chaos
+  stand and the load stand, with the stand logs uploaded on failure;
+* the load stand measures the property this plugin was written for: thousands of
+  requests without the cookie produce a handful of log lines (throttling and one
+  warning per middleware instance), instead of one warning per request.
+
 ## 1.0.0 (2026-11-26)
 
 Initial release of `traefik-cookie-extract`, a standalone Traefik middleware

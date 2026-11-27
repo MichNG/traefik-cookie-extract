@@ -1,4 +1,4 @@
-.PHONY: test test-race cover yaegi-check integration e2e
+.PHONY: test test-race cover yaegi-check integration e2e integration-nightly chaos bench-e2e nightly
 
 # Runs gofmt, go vet and the whole test suite. The Go caches are kept inside
 # the repository so that the target also works in restricted environments.
@@ -28,3 +28,20 @@ integration:
 # Traefik log file, never into the process output, and logLevel: off is silent.
 e2e:
 	@./e2e.sh
+
+# The docker stands of the nightly pipeline (non-default host ports, every script
+# brings its own stand up and down). See .github/workflows/nightly.yml.
+integration-nightly:
+	@./hack/ci/integration.sh
+
+# Faults injected while the plugin serves traffic: backend and Traefik restarts,
+# a reload storm, hostile requests, and a spam phase that must stay quiet.
+chaos:
+	@./hack/ci/chaos.sh
+
+# End-to-end load: throughput and latency percentiles, and the log volume under
+# load (the anti-spam property of the plugin).
+bench-e2e:
+	@./hack/bench/run.sh
+
+nightly: integration-nightly chaos bench-e2e

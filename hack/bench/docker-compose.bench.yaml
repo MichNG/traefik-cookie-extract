@@ -1,0 +1,43 @@
+# e2e load/benchmark stand: one Traefik in front of traefik/whoami, with the
+# cookieExtract plugin mounted as a local plugin.
+#
+# Started by hack/bench/run.sh, which exports:
+#   BENCH_CONF_DIR    generated traefik.yaml + dynamic.yaml (the routers and the
+#                     middleware instances of the cases);
+#   BENCH_PLUGIN_DIR  the runtime sources of the plugin, copied to a scratch dir
+#                     so that the stand also proves the plugin needs nothing but
+#                     the Go standard library;
+#   BENCH_LOGS_DIR    the directory Traefik writes its log file to: the plugin
+#                     messages land there, never on the process output.
+#
+# Traefik runs at DEBUG level on purpose: writes to the interpreted stdout are
+# only shown by the Traefik logger at debug level (see logger.go), whatever the
+# logLevel of the middleware is. The plugin throttles its own lines.
+name: cookie-extract-bench
+
+services:
+  traefik:
+    image: traefik:${TRAEFIK_VERSION:-v3.8.0}
+    command:
+      - --api.insecure=true
+      - --log.level=DEBUG
+      - --log.filePath=/var/log/traefik/traefik.log
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
+      - --experimental.localplugins.cookieExtract.modulename=github.com/MichNG/traefik-cookie-extract
+    ports:
+      - "${BENCH_HTTP_PORT:-18500}:8000"
+      - "${BENCH_API_PORT:-18580}:8080"
+    volumes:
+      # The two configuration files are mounted one by one: a directory bind
+      # mount of the host conf dir at /etc/traefik makes Traefik 3.8 fall back to
+      # a silent, flag-less startup (no router, no log), while single file mounts
+      # behave. The static file is complete (see hack/bench/run.sh): when a
+      # static configuration file is present Traefik uses it as-is, so the CLI
+      # flags of the service command are kept for the stand definition only.
+      - ${BENCH_CONF_DIR:?BENCH_CONF_DIR is not set}/traefik.yaml:/etc/traefik/traefik.yaml:ro
+      - ${BENCH_CONF_DIR:?BENCH_CONF_DIR is not set}/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
+      - ${BENCH_PLUGIN_DIR:?BENCH_PLUGIN_DIR is not set}:/plugins-local/src/github.com/MichNG/traefik-cookie-extract:ro
+      - ${BENCH_LOGS_DIR:?BENCH_LOGS_DIR is not set}:/var/log/traefik
+
+  target:
+    image: traefik/whoami

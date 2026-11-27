@@ -1,0 +1,127 @@
+name: Nightly
+
+# The nightly pipeline is the slow half of the CI: the stands below start real
+# Traefik containers, one of them breaks the stand on purpose while traffic is
+# running, and the load stand measures throughput, latency and the log volume
+# under load. The push/pull pipelines stay fast and hermetic (see ci.yml).
+#
+# Everything runs non-interactively, every check ends with a non-zero exit code,
+# and the stand logs are uploaded when a job fails.
+on:
+  schedule:
+    # 00:37 UTC = 03:37 MSK. Off the hour on purpose: GitHub queues the :00 runs.
+    - cron: '37 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The stand logs and summaries are collected here (see hack/ci/lib.sh) and
+  # uploaded on failure.
+  ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+
+jobs:
+  unit:
+    name: unit (race) + yaegi
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: tests (race)
+        run: go test -race ./...
+
+      # Loads the plugin with the same Yaegi interpreter Traefik uses.
+      - name: yaegi compatibility check
+        run: make yaegi-check
+
+  integration:
+    name: integration (log routing, levels, reload, hostile values)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Host ports are not the default ones: a stand never fights over 8000/8080.
+      HTTP_PORT: 28100
+      API_PORT: 28180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: integration stand
+        run: hack/ci/integration.sh
+
+      - name: upload the stand logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-integration-logs
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  chaos:
+    name: chaos (faults under load)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HTTP_PORT: 28400
+      API_PORT: 28480
+      LOAD_WORKERS: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      # Backend and Traefik restarts, a reload storm, hostile requests and a spam
+      # phase, all under traffic; the plugin must keep serving without flooding
+      # the log.
+      - name: chaos stand
+        run: hack/ci/chaos.sh
+
+      - name: upload the stand logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-chaos-logs
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  load:
+    name: load (throughput, latency, log volume)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BENCH_HTTP_PORT: 18500
+      BENCH_API_PORT: 18580
+      BENCH_WORKERS: 32
+      BENCH_DURATION: 10s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # The load generator is built from hack/bench/loadgen; the summary table
+      # (rps, latency percentiles, plugin log lines per case) lands in
+      # artifacts/bench/summary.txt.
+      - name: load stand
+        run: ./hack/bench/run.sh
+
+      - name: upload the artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-load-logs
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

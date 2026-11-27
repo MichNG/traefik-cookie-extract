@@ -165,6 +165,47 @@ through it (configuration errors, cookie extraction, missing cookie, log
 routing): run it before every release, it catches this class of incompatibility
 in seconds.
 
+## Testing
+
+Four levels, from the fastest to the slowest:
+
+| Level | What it covers | Where |
+| :--- | :--- | :--- |
+| unit (race) + yaegi | the middleware, the logger, the yaegi compatibility | `./run-tests.sh -race`, `make yaegi-check` — `ci.yml` |
+| end to end | the plugin loaded by a real Traefik (local plugin), on the `v3.5`-`v3.8` matrix: the translation, the log routing, `logLevel: off` | `./e2e.sh` — `ci.yml` |
+| integration stand | log levels, per-instance isolation, configuration reload, spoofing, JSON cookie, hostile values, invalid configurations | `hack/ci/integration.sh` — nightly |
+| chaos stand | backend and Traefik restarts, a reload storm, hostile requests and a spam phase, all under traffic | `hack/ci/chaos.sh` — nightly |
+| load stand | throughput and latency percentiles per case, and the plugin log volume under load | `hack/bench/run.sh` — nightly |
+
+```bash
+./run-tests.sh -race            # gofmt + go vet + go test (works inside restricted sandboxes)
+make yaegi-check                # loads the plugin with yaegi v0.16.1 (as Traefik does)
+./e2e.sh                        # the plugin in a real Traefik, logging behaviour
+HTTP_PORT=28100 API_PORT=28180 ./hack/ci/integration.sh
+HTTP_PORT=28400 API_PORT=28480 ./hack/ci/chaos.sh
+BENCH_WORKERS=32 BENCH_DURATION=10s ./hack/bench/run.sh
+```
+
+Every stand writes its summary (checks and evidence) and the Traefik log into
+`artifacts/<stand>/`, brings its own containers up and down, and uses
+`ARTIFACTS_DIR`/`*_PORT`/`WORK` knobs, so several stands can run side by side.
+
+What the stands pin down, measured on the stands themselves:
+
+* **no log flood**: 4000 requests without the cookie produce **3 plugin lines**
+  (one warning per instance and the throttled detail) — the property this plugin
+  was written for. The load stand asserts the bound under load;
+* **no process output**: the plugin messages never reach the container stdout,
+  i.e. they cannot land in journald/`/var/log/messages`;
+* **the value is never logged** (it is a credential);
+* **per-instance levels**: a `debug` middleware does not turn on the logs of the
+  other instances, and a configuration reload rebuilds the instance with its new
+  level;
+* **known limitations, recorded by the integration stand** (see the analysis
+  behind the proposals): with no cookie the client-supplied header is left
+  untouched (spoofing), a JSON cookie is forwarded verbatim (no field support),
+  and an empty cookie value still sets the header with its bare prefix.
+
 ## Development
 
 Examples (`example/`): the Docker stand (`docker-compose.yaml`) mounts the plugin
