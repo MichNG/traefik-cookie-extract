@@ -58,6 +58,7 @@ func main() {
 	checkConfigurationErrors(i)
 	checkExtraction(i, &stdout)
 	checkMissingCookie(i, &stdout, &stderr)
+	checkCookieFieldAndPolicies(i, &stdout)
 
 	fmt.Println("OK: the plugin compiles and behaves correctly under yaegi")
 }
@@ -242,6 +243,87 @@ func checkMissingCookie(i *interp.Interpreter, stdout, stderr *bytes.Buffer) {
 
 	fmt.Printf("%d requests without the cookie -> 1 warning, 1 throttled debug line\n", requests)
 	fmt.Println("OK: the missing cookie does not flood the logs")
+}
+
+// checkCookieFieldAndPolicies exercises the JSON field extraction and the
+// missing cookie policies under yaegi: encoding/json and net/url are called from
+// interpreted code here, the strip policy must remove a client-supplied header,
+// and the deny policy must answer 401.
+func checkCookieFieldAndPolicies(i *interp.Interpreter, stdout *bytes.Buffer) {
+	fmt.Println("=== a JSON cookie field, and the missing cookie policies ===")
+	stdout.Reset()
+
+	var seen http.Header
+
+	handler := runMiddleware(i, "yaegicheck-field", func(value reflect.Value) {
+		value.FieldByName("CookieName").SetString("session")
+		value.FieldByName("CookieField").SetString("user.id")
+		value.FieldByName("HeaderNameForCookieValue").SetString("X-Tenant")
+		value.FieldByName("CookieValuePrefix").SetString("")
+		value.FieldByName("LogLevel").SetString("debug")
+	}, &seen)
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+	req.Header.Set("Cookie", "session=%7B%22user%22%3A%7B%22id%22%3A%22acme%22%7D%7D")
+
+	rec := httptest.NewRecorder()
+	callHandler(handler, rec, req)
+
+	if rec.Code != http.StatusOK {
+		fail("cookieField: status = %d, want 200", rec.Code)
+	}
+
+	if got, want := seen.Get("X-Tenant"), "acme"; got != want {
+		fail("cookieField: the header is %q, want %q", got, want)
+	}
+
+	fmt.Println("  cookieField: the percent-encoded JSON field reached the header")
+
+	// strip: a client-supplied header of the same name must not survive.
+	seen = http.Header{}
+
+	handler = runMiddleware(i, "yaegicheck-strip", func(value reflect.Value) {
+		value.FieldByName("CookieName").SetString(cookieName)
+		value.FieldByName("MissingCookiePolicy").SetString("strip")
+		value.FieldByName("LogLevel").SetString("off")
+	}, &seen)
+
+	req = httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+	req.Header.Set("Authorization", "Bearer client")
+
+	rec = httptest.NewRecorder()
+	callHandler(handler, rec, req)
+
+	if got := seen.Get("Authorization"); got != "" {
+		fail("strip: the client header %q reached the backend", got)
+	}
+
+	fmt.Println("  strip: the client-supplied header was removed")
+
+	// deny: 401 before the backend.
+	seen = http.Header{}
+
+	handler = runMiddleware(i, "yaegicheck-deny", func(value reflect.Value) {
+		value.FieldByName("CookieName").SetString(cookieName)
+		value.FieldByName("MissingCookiePolicy").SetString("deny")
+		value.FieldByName("LogLevel").SetString("off")
+	}, &seen)
+
+	req = httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+
+	rec = httptest.NewRecorder()
+	callHandler(handler, rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		fail("deny: status = %d, want 401", rec.Code)
+	}
+
+	if got := seen.Get("Authorization"); got != "" {
+		fail("deny: the request reached the backend (header %q)", got)
+	}
+
+	fmt.Println("  deny: 401 without reaching the backend")
+	fmt.Println("OK: the JSON cookie field and the missing cookie policies behave correctly under yaegi")
 }
 
 // runMiddleware creates the middleware under test with the given configuration,

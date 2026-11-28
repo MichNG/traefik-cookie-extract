@@ -45,8 +45,10 @@ func TestCreateConfig(t *testing.T) {
 
 	require.NotNil(t, cfg)
 	assert.Empty(t, cfg.CookieName)
+	assert.Empty(t, cfg.CookieField)
 	assert.Equal(t, defaultHeaderName, cfg.HeaderNameForCookieValue)
 	assert.Equal(t, defaultValuePrefix, cfg.CookieValuePrefix)
+	assert.Equal(t, MissingCookieKeep, cfg.MissingCookiePolicy)
 	assert.Equal(t, LogLevelInfo, cfg.LogLevel)
 }
 
@@ -61,6 +63,17 @@ func TestConfigDecoding(t *testing.T) {
 		assert.Equal(t, defaultHeaderName, cfg.HeaderNameForCookieValue)
 		assert.Equal(t, defaultValuePrefix, cfg.CookieValuePrefix)
 		assert.Equal(t, LogLevelInfo, cfg.LogLevel)
+	})
+
+	t.Run("the JSON field and the missing cookie policy are decoded", func(t *testing.T) {
+		cfg := decodeConfig(t, map[string]interface{}{
+			"cookieName":          testCookieName,
+			"cookieField":         "user.id",
+			"missingCookiePolicy": MissingCookieStrip,
+		})
+
+		assert.Equal(t, "user.id", cfg.CookieField)
+		assert.Equal(t, MissingCookieStrip, cfg.MissingCookiePolicy)
 	})
 
 	t.Run("every field is decoded", func(t *testing.T) {
@@ -110,6 +123,16 @@ func TestNewRejectsAnInvalidConfiguration(t *testing.T) {
 			name: "unsupported logLevel",
 			cfg:  &Config{CookieName: testCookieName, LogLevel: "verbose"},
 			want: `unsupported logLevel "verbose", expected one of: off, warn, info, debug`,
+		},
+		{
+			name: "unsupported missingCookiePolicy",
+			cfg:  &Config{CookieName: testCookieName, HeaderNameForCookieValue: testHeaderName, MissingCookiePolicy: "drop"},
+			want: `unsupported missingCookiePolicy "drop", expected one of: keep, strip, deny`,
+		},
+		{
+			name: "invalid cookieField",
+			cfg:  &Config{CookieName: testCookieName, HeaderNameForCookieValue: testHeaderName, CookieField: "user..id"},
+			want: "invalid cookieField",
 		},
 	}
 
@@ -161,9 +184,11 @@ func TestServeHTTPSetsTheHeaderFromTheCookie(t *testing.T) {
 			want:    wantHeaderLine,
 		},
 		{
+			// An empty cookie value is handled like a missing cookie: the missing
+			// cookie policy applies and the header is left untouched by default.
 			name:    "an empty value",
 			cookies: []*http.Cookie{&emptyValue},
-			want:    testValuePrefix,
+			want:    "",
 		},
 		{
 			name:    "no cookie",
@@ -431,6 +456,163 @@ func send(handler http.Handler, cookies ...*http.Cookie) *httptest.ResponseRecor
 	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
 	for _, cookie := range cookies {
 		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	return rec
+}
+
+// TestCookieFieldExtraction covers the field of a JSON cookie value, including
+// the percent-encoded form clients really send (a raw JSON cookie is dropped by
+// Go's HTTP server before the plugin sees it).
+func TestCookieFieldExtraction(t *testing.T) {
+	tests := []struct {
+		name   string
+		cookie string
+		field  string
+		prefix string
+		want   string
+	}{
+		{
+			name:   "percent-encoded JSON, top level field",
+			cookie: "session=%7B%22tenant%22%3A%22acme%22%7D",
+			field:  "tenant", prefix: testValuePrefix, want: "Bearer acme",
+		},
+		{
+			// A raw JSON cookie is dropped by Go's HTTP server (the quotes are not
+			// valid in a cookie value): a client can never send it and the plugin
+			// only sees the percent-encoded form. jsonField has direct unit tests.
+			name:   "raw JSON is dropped by the cookie parser",
+			cookie: `session={"tenant":"acme"}`,
+			field:  "tenant", prefix: testValuePrefix, want: "",
+		},
+		{
+			// A payload that is both valid JSON and a valid cookie value exercises
+			// the raw form of the field extraction.
+			name:   "a JSON array is read without decoding",
+			cookie: "session=[1,2]",
+			field:  "0", prefix: testValuePrefix, want: "Bearer 1",
+		},
+		{
+			name:   "nested field",
+			cookie: "session=%7B%22user%22%3A%7B%22id%22%3A%22u1%22%7D%7D",
+			field:  "user.id", prefix: testValuePrefix, want: "Bearer u1",
+		},
+		{
+			name:   "array element, bracket form",
+			cookie: "session=%7B%22items%22%3A%5B%7B%22id%22%3A%22x%22%7D%5D%7D",
+			field:  "items[0].id", prefix: testValuePrefix, want: "Bearer x",
+		},
+		{
+			name:   "a number keeps the exact text of the payload",
+			cookie: "session=%7B%22sub%22%3A12345678901234567890%7D",
+			field:  "sub", prefix: testValuePrefix, want: "Bearer 12345678901234567890",
+		},
+		{
+			name:   "an empty prefix writes the raw field",
+			cookie: "session=%7B%22t%22%3A%22tok%22%7D",
+			field:  "t", prefix: "", want: "tok",
+		},
+		{
+			name:   "a missing field leaves the header untouched (policy keep)",
+			cookie: "session=%7B%22other%22%3A%22x%22%7D",
+			field:  "tenant", prefix: testValuePrefix, want: "",
+		},
+		{
+			name:   "a payload that is not JSON",
+			cookie: "session=plain-token",
+			field:  "tenant", prefix: testValuePrefix, want: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.CookieName = "session"
+			cfg.CookieField = test.field
+			cfg.CookieValuePrefix = test.prefix
+
+			handler, seen := newMiddleware(t, cfg)
+			rec := sendHeader(handler, test.cookie)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, test.want, (*seen).Get(testHeaderName))
+		})
+	}
+}
+
+// TestMissingCookiePolicies covers the three policies on the cases that carry no
+// value: no cookie at all and an empty cookie value.
+func TestMissingCookiePolicies(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     string
+		cookie     string
+		wantCode   int
+		wantHeader string
+	}{
+		{name: "keep, no cookie: the client header survives", policy: MissingCookieKeep, wantCode: http.StatusOK, wantHeader: "Bearer client"},
+		{name: "strip, no cookie: the client header is removed", policy: MissingCookieStrip, wantCode: http.StatusOK, wantHeader: ""},
+		{name: "deny, no cookie: 401", policy: MissingCookieDeny, wantCode: http.StatusUnauthorized, wantHeader: ""},
+		{name: "keep, empty value: the client header survives", policy: MissingCookieKeep, cookie: testCookieName + "=", wantCode: http.StatusOK, wantHeader: "Bearer client"},
+		{name: "strip, empty value: the client header is removed", policy: MissingCookieStrip, cookie: testCookieName + "=", wantCode: http.StatusOK, wantHeader: ""},
+		{name: "deny, empty value: 401", policy: MissingCookieDeny, cookie: testCookieName + "=", wantCode: http.StatusUnauthorized, wantHeader: ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			captureStdout(t)
+
+			cfg := testConfig()
+			cfg.MissingCookiePolicy = test.policy
+
+			handler, seen := newMiddleware(t, cfg)
+
+			req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+			req.Header.Set(testHeaderName, "Bearer client")
+			if test.cookie != "" {
+				req.Header.Set("Cookie", test.cookie)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			require.Equal(t, test.wantCode, rec.Code)
+			assert.Equal(t, test.wantHeader, (*seen).Get(testHeaderName))
+		})
+	}
+}
+
+// TestControlCharactersAreRefused checks that a field decoded from a JSON payload
+// (which can legitimately contain an escaped newline) never reaches the header.
+func TestControlCharactersAreRefused(t *testing.T) {
+	captureStdout(t)
+
+	cfg := testConfig()
+	cfg.CookieName = "session"
+	cfg.CookieField = "t"
+	cfg.MissingCookiePolicy = MissingCookieStrip
+
+	handler, seen := newMiddleware(t, cfg)
+
+	// The percent-encoded form of a payload whose field carries an escaped
+	// newline: the escape decodes to a real newline, which must never reach a
+	// header.
+	rec := sendHeader(handler, "session=%7B%22t%22%3A%22a%5Cnb%22%7D")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, (*seen).Get(testHeaderName), "a value with a control character must not be written")
+}
+
+// sendHeader drives a request whose Cookie header is set verbatim: the raw form
+// is needed for a JSON payload and for the invalid values (AddCookie would
+// sanitize the value).
+func sendHeader(handler http.Handler, cookie string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
 	}
 
 	rec := httptest.NewRecorder()

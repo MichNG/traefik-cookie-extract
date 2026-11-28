@@ -11,15 +11,16 @@
 #
 #   1. translation       cookie -> Authorization: Bearer <value>, a custom header
 #                        and an empty prefix, next to other cookies
-#   2. spoofing          no cookie + a client-sent Authorization header: the value
-#                        reaches the backend (current contract, recorded as a
-#                        limitation, see the README)
+#   2. spoofing          no cookie + a client-sent Authorization header: with the
+#                        default policy (keep) the value reaches the backend, with
+#                        strip it is removed and with deny the request is a 401
 #   3. log levels        warn / debug / off, the single warning per middleware
 #                        instance and the throttled per-request detail
 #   4. isolation         two middlewares with different levels in one Traefik
 #   5. reload            the middleware instance is rebuilt on a configuration
 #                        change and the new log level applies
-#   6. JSON cookie       a JSON cookie is forwarded verbatim (no field support)
+#   6. JSON cookie       a JSON cookie is forwarded verbatim without cookieField,
+#                        and the configured field is extracted with it
 #   7. hostile values    a 4 KiB value, sixty cookies, an empty value, percent
 #                        sequences (no decoding, so no CRLF injection)
 #   8. invalid configs   the middleware is disabled with an explicit error
@@ -117,6 +118,21 @@ http:
       entryPoints: [web]
       middlewares: [r-json]
       service: target
+    field:
+      rule: "PathPrefix(\`/field\`)"
+      entryPoints: [web]
+      middlewares: [r-field]
+      service: target
+    strip:
+      rule: "PathPrefix(\`/strip\`)"
+      entryPoints: [web]
+      middlewares: [r-strip]
+      service: target
+    deny:
+      rule: "PathPrefix(\`/deny\`)"
+      entryPoints: [web]
+      middlewares: [r-deny]
+      service: target
     hostile:
       rule: "PathPrefix(\`/hostile\`)"
       entryPoints: [web]
@@ -209,6 +225,33 @@ http:
           cookieName: access_token
           logLevel: debug
 
+    # The field of a JSON cookie value: the plugin writes the field, not the
+    # whole (percent-encoded) payload.
+    r-field:
+      plugin:
+        cookieExtract:
+          cookieName: session
+          cookieField: user.id
+          headerNameForCookieValue: X-Tenant
+          cookieValuePrefix: ""
+          logLevel: debug
+
+    # A client-supplied header of the same name must not reach the backend.
+    r-strip:
+      plugin:
+        cookieExtract:
+          cookieName: access_token
+          missingCookiePolicy: strip
+          logLevel: debug
+
+    # No cookie: 401 before the backend.
+    r-deny:
+      plugin:
+        cookieExtract:
+          cookieName: access_token
+          missingCookiePolicy: deny
+          logLevel: warn
+
     r-bad-name:
       plugin:
         cookieExtract:
@@ -297,6 +340,23 @@ scenario_spoofing() {
 
     summary "no cookie at all: no header at the backend"
     assert_backend_header_absent "$(http_body "$(backend_url)spoof")" Authorization "no cookie, no client header"
+
+    summary "missingCookiePolicy: strip - the client header never reaches the backend"
+    reset_traefik_log
+    assert_backend_header_absent "$(http_body "$(backend_url)strip" -H "Authorization: Bearer client-supplied")" \
+        Authorization "the client-supplied header was removed by the strip policy"
+    wait_plugin_lines 1 'r-strip@file\]' 5 "the strip policy reports the missing value"
+    drain_plugin_log
+    assert_plugin_lines_at_most 1 'r-strip@file\] WARN  no' "the strip instance warned at most once per instance"
+
+    summary "missingCookiePolicy: deny - 401 before the backend"
+    reset_traefik_log
+    local deny_code
+    deny_code="$(http_code "$(backend_url)deny")"
+    ((deny_code == 401)) || die "stand ${STAND}: missingCookiePolicy deny must answer 401, got ${deny_code}"
+    assert_backend_header_absent "$(http_body "$(backend_url)deny")" Authorization "the denied request never reached the backend"
+    wait_plugin_lines 1 'r-deny@file\] WARN  rejecting the request' 5 "the deny policy reports the rejection"
+    summary "  /deny -> HTTP ${deny_code}, no backend call"
 }
 
 # ---------------------------------------------------------------------------
@@ -408,6 +468,15 @@ scenario_json_cookie() {
     assert_backend_header_absent "$(http_body "$(backend_url)json" -H 'Cookie: other=1')" \
         X-Session "no session cookie: the header is not set"
 
+    summary "cookieField: the field of the percent-encoded JSON reaches the header"
+    reset_traefik_log
+    assert_backend_header "$(http_body "$(backend_url)field" -H 'Cookie: session=%7B%22user%22%3A%7B%22id%22%3A%22acme%22%7D%7D')" \
+        X-Tenant "acme$" "cookieField extracts a nested field"
+    assert_backend_header_absent "$(http_body "$(backend_url)field" -H 'Cookie: session=%7B%22user%22%3A%7B%22name%22%3A%22acme%22%7D%7D')" \
+        X-Tenant "cookieField: a missing field leaves the header unset"
+    assert_backend_header_absent "$(http_body "$(backend_url)field" -H 'Cookie: session=%7B%22user%22%3A%7B%22id%22%3A%22a%5Cnb%22%7D%7D')" \
+        X-Tenant "cookieField: a field carrying a control character is refused"
+
     summary "a raw JSON cookie is dropped by the HTTP layer before the plugin sees it"
     local code body
     code="$(http_code "$(backend_url)json" -H 'Cookie: session={"tenant":"acme"}')"
@@ -436,9 +505,11 @@ scenario_hostile_values() {
     assert_backend_header "$(http_body "$(backend_url)hostile" -H "Cookie: ${cookies}${COOKIE_NAME}=${COOKIE_VALUE}")" \
         Authorization "Bearer ${COOKIE_VALUE}" "the cookie is found among sixty others"
 
-    summary "an empty cookie value still sets the header (LIMITATION: the bare prefix)"
-    assert_backend_header "$(http_body "$(backend_url)hostile" -H "Cookie: ${COOKIE_NAME}=")" \
-        Authorization "Bearer ?$" "an empty value produces the bare prefix"
+    summary "an empty cookie value is handled like a missing cookie"
+    assert_backend_header_absent "$(http_body "$(backend_url)hostile" -H "Cookie: ${COOKIE_NAME}=")" \
+        Authorization "an empty value does not set the header"
+    assert_backend_header_absent "$(http_body "$(backend_url)strip" -H "Cookie: ${COOKIE_NAME}=" -H "Authorization: Bearer client")" \
+        Authorization "strip also removes the client header on an empty value"
 
     summary "percent sequences are not decoded: no CRLF injection"
     local body

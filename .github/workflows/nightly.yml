@@ -45,6 +45,11 @@ jobs:
       - name: yaegi compatibility check
         run: make yaegi-check
 
+      # The field extraction and the header value are fuzzed for a bounded time
+      # (the seed corpus already runs with the unit tests).
+      - name: fuzz (bounded)
+        run: make fuzz
+
   integration:
     name: integration (log routing, levels, reload, hostile values)
     runs-on: ubuntu-latest

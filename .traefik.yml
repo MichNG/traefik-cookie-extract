@@ -8,6 +8,7 @@ summary: 'Traefik Cookie Extract: takes the value of a cookie (typically an acce
 
 testData:
   cookieName: test_access_token
+  missingCookiePolicy: keep
   headerNameForCookieValue: Authorization
   cookieValuePrefix: 'Bearer '
   logLevel: info

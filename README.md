@@ -80,10 +80,41 @@ http:
 | `cookieName` | Name of the cookie whose value is extracted. Required: an empty name, or a name that can never match a cookie (space, tab, `;`, `,`, `=`, control character), disables the middleware with an explicit error. | — (required) |
 | `headerNameForCookieValue` | Header the cookie value is written to. Must not be empty. | `Authorization` |
 | `cookieValuePrefix` | String prepended to the cookie value. Set it to `""` to write the raw value. | `Bearer ` |
+| `cookieField` | Field of a JSON cookie value to write instead of the whole value. Dot paths (`user.id`), array indexes (`users.0.id`, `items[0].id`) and scalars are supported. The value is tried as is, then percent-decoded, because a JSON cookie is sent percent-encoded (Go drops a raw one). | `""` (the whole value) |
+| `missingCookiePolicy` | What to do when there is no value to write (no cookie, missing field, empty value, or a value carrying control characters): `keep` (the target header is left untouched), `strip` (the target header is removed) or `deny` (`401`). See [Security](#security-a-client-supplied-header). | `keep` |
 | `logLevel` | Verbosity of the plugin: `off`, `warn`, `info` or `debug` (case insensitive). See [Logs](#logs). | `info` |
 
-The plugin only reads the request: it never modifies the cookie, and it never
-touches a request that does not carry the configured cookie.
+The plugin only reads the request: it never modifies the cookie.
+
+### Security: a client-supplied header
+
+With the default `missingCookiePolicy: keep`, a request that carries no value
+leaves the target header untouched, exactly as before. That is convenient for a
+service whose backend tolerates a missing token, but it also means that a client
+can send its own `Authorization` header (or a header another middleware reads)
+and have it forwarded: the plugin only confirms it, it does not authenticate
+anybody.
+
+Two policies close that path inside the plugin, without adding another
+middleware in front:
+
+```yaml
+plugin:
+  cookieExtract:
+    cookieName: access_token
+    missingCookiePolicy: strip   # keep | strip | deny
+```
+
+* `strip` removes the target header, so a client-supplied value never reaches
+  the backend, while the request itself still reaches it (unauthenticated, as it
+  would without the header);
+* `deny` answers `401` before the backend is called.
+
+The same policy covers a cookie that is present but unusable: an absent
+`cookieField`, an empty value, or a value carrying control characters. Values
+with control characters are never written into a header (a field decoded from a
+JSON payload can legitimately contain an escaped newline, which would be a
+header injection).
 
 ## Logs
 
@@ -201,10 +232,15 @@ What the stands pin down, measured on the stands themselves:
 * **per-instance levels**: a `debug` middleware does not turn on the logs of the
   other instances, and a configuration reload rebuilds the instance with its new
   level;
-* **known limitations, recorded by the integration stand** (see the analysis
-  behind the proposals): with no cookie the client-supplied header is left
-  untouched (spoofing), a JSON cookie is forwarded verbatim (no field support),
-  and an empty cookie value still sets the header with its bare prefix.
+* **the hardening is verified**: with `missingCookiePolicy: strip` a
+  client-supplied header never reaches the backend, with `deny` the request is a
+  `401` and the backend is not called, and a field carrying a control character
+  is refused;
+* **the field of a JSON cookie** is extracted (nested path, percent-encoded
+  payload) and a missing field leaves the header unset;
+* **with the default `keep`** the client-supplied header still reaches the
+  backend: the integration stand keeps pinning that behaviour, which is the
+  reason `strip`/`deny` exist.
 
 ## Development
 

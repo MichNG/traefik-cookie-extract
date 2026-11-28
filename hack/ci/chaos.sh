@@ -270,8 +270,9 @@ scenario_hostile_requests() {
     assert_backend_header "$(http_body "$(backend_url)chaos" -H "Cookie: ${cookies}${COOKIE_NAME}=${COOKIE_VALUE}")" \
         Authorization "Bearer ${COOKIE_VALUE}" "the cookie is found among 120 others"
 
-    assert_backend_header "$(http_body "$(backend_url)chaos" -H "Cookie: ${COOKIE_NAME}=")" \
-        Authorization "Bearer ?$" "an empty value produces the bare prefix"
+    summary "an empty cookie value is handled like a missing cookie"
+    assert_backend_header_absent "$(http_body "$(backend_url)chaos" -H "Cookie: ${COOKIE_NAME}=")" \
+        Authorization "an empty value does not set the header"
 
     body="$(http_body "$(backend_url)chaos" -H "Cookie: ${COOKIE_NAME}=x%0D%0AX-Evil:1")"
     assert_backend_header_absent "${body}" X-Evil "a percent sequence does not create a header"

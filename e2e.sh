@@ -79,7 +79,18 @@ check_count() { # file pattern(ERE) expected description
 prepare_plugin() {
   rm -rf "$PLUGIN_DIR"
   mkdir -p "$PLUGIN_DIR"
-  cp .traefik.yml go.mod cookieextract.go logger.go "$PLUGIN_DIR/"
+  cp .traefik.yml go.mod "$PLUGIN_DIR/"
+
+  # Every runtime source (the test files are not part of the plugin package): the
+  # copy is explicit so that the stand proves the plugin needs nothing but the Go
+  # standard library, and a glob so that a new file is never forgotten.
+  local f
+  for f in ./*.go; do
+    case "${f}" in
+    *_test.go) continue ;;
+    esac
+    cp "${f}" "$PLUGIN_DIR/"
+  done
 }
 
 write_configs() { # plugin_log_level traefik_log_level

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -21,6 +22,19 @@ import (
 const (
 	defaultHeaderName  = "Authorization"
 	defaultValuePrefix = "Bearer "
+)
+
+// Values accepted by the missingCookiePolicy option.
+const (
+	// MissingCookieKeep leaves the target header untouched: a client-supplied
+	// header of the same name reaches the backend (historical behaviour).
+	MissingCookieKeep = "keep"
+	// MissingCookieStrip removes the target header, so that a client cannot
+	// smuggle its own value past the middleware.
+	MissingCookieStrip = "strip"
+	// MissingCookieDeny rejects the request with 401 before the backend is
+	// reached.
+	MissingCookieDeny = "deny"
 )
 
 // Config is the plugin configuration. The defaults are set by CreateConfig, so
@@ -31,12 +45,26 @@ type Config struct {
 	// required: an empty name, or a name that can never match a cookie,
 	// disables the middleware with an explicit error.
 	CookieName string `json:"cookieName,omitempty" toml:"cookieName,omitempty" yaml:"cookieName,omitempty" mapstructure:"cookieName"`
+	// CookieField selects a field of a JSON cookie value instead of the whole
+	// value: dot paths ("user.id"), array indexes ("users.0.id", "items[0].id")
+	// and scalars (string, number, boolean) are supported. The value is tried as
+	// is, then percent-decoded, because a JSON payload cannot be sent raw inside
+	// a cookie. Empty means the whole cookie value.
+	CookieField string `json:"cookieField,omitempty" toml:"cookieField,omitempty" yaml:"cookieField,omitempty" mapstructure:"cookieField"`
 	// HeaderNameForCookieValue is the header the cookie value is written to.
 	// It defaults to Authorization.
 	HeaderNameForCookieValue string `json:"headerNameForCookieValue,omitempty" toml:"headerNameForCookieValue,omitempty" yaml:"headerNameForCookieValue,omitempty" mapstructure:"headerNameForCookieValue"`
 	// CookieValuePrefix is prepended to the cookie value. It defaults to
 	// "Bearer " and may be set to an empty string.
 	CookieValuePrefix string `json:"cookieValuePrefix,omitempty" toml:"cookieValuePrefix,omitempty" yaml:"cookieValuePrefix,omitempty" mapstructure:"cookieValuePrefix"`
+	// MissingCookiePolicy defines what happens when there is no value to write: a
+	// request without the cookie, without the configured field, with an empty
+	// cookie value, or with a value carrying control characters.
+	//   keep  - the target header is left untouched (default);
+	//   strip - the target header is removed, so that a client cannot smuggle its
+	//           own value past the middleware;
+	//   deny  - the request is rejected with 401.
+	MissingCookiePolicy string `json:"missingCookiePolicy,omitempty" toml:"missingCookiePolicy,omitempty" yaml:"missingCookiePolicy,omitempty" mapstructure:"missingCookiePolicy"`
 	// LogLevel is the verbosity of the plugin: off, warn, info (default) or
 	// debug. See the README: the messages are reported in the Traefik log, and
 	// `off` silences the plugin completely.
@@ -48,6 +76,7 @@ func CreateConfig() *Config {
 	return &Config{
 		HeaderNameForCookieValue: defaultHeaderName,
 		CookieValuePrefix:        defaultValuePrefix,
+		MissingCookiePolicy:      MissingCookieKeep,
 		LogLevel:                 LogLevelInfo,
 	}
 }
@@ -58,9 +87,11 @@ type CookieExtract struct {
 	name   string
 	logger *pluginLogger
 
-	cookieName  string
-	headerName  string
-	valuePrefix string
+	cookieName    string
+	cookieField   string
+	headerName    string
+	valuePrefix   string
+	missingPolicy string
 
 	// missingCookieWarned limits the warning of a request without the cookie
 	// to the first occurrence of the middleware instance.
@@ -99,13 +130,20 @@ func newCookieExtract(_ context.Context, next http.Handler, config *Config, name
 		return nil, err
 	}
 
+	policy, err := parseMissingCookiePolicy(config.MissingCookiePolicy)
+	if err != nil {
+		return nil, err
+	}
+
 	return &CookieExtract{
-		next:        next,
-		name:        name,
-		logger:      newPluginLogger(name, level),
-		cookieName:  config.CookieName,
-		headerName:  config.HeaderNameForCookieValue,
-		valuePrefix: config.CookieValuePrefix,
+		next:          next,
+		name:          name,
+		logger:        newPluginLogger(name, level),
+		cookieName:    config.CookieName,
+		cookieField:   config.CookieField,
+		headerName:    config.HeaderNameForCookieValue,
+		valuePrefix:   config.CookieValuePrefix,
+		missingPolicy: policy,
 	}, nil
 }
 
@@ -113,39 +151,87 @@ func newCookieExtract(_ context.Context, next http.Handler, config *Config, name
 func (ce *CookieExtract) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ce.logger.debugf("serving %s %s", req.Method, req.URL.Path)
 
-	cookie, err := req.Cookie(ce.cookieName)
-	if err != nil {
-		ce.logMissingCookie()
-		ce.next.ServeHTTP(rw, req)
+	value, reason := ce.cookieHeaderValue(req)
+	if reason != "" {
+		ce.handleMissingValue(rw, req, reason)
 
 		return
 	}
 
 	// The value is never logged: it is a credential, and the Traefik log may be
 	// shipped to an aggregator.
-	req.Header.Set(ce.headerName, ce.valuePrefix+cookie.Value)
+	req.Header.Set(ce.headerName, ce.valuePrefix+value)
 	ce.logger.infof("set the %s header from the %q cookie", ce.headerName, ce.cookieName)
 
 	ce.next.ServeHTTP(rw, req)
 }
 
-// logMissingCookie reports a request without the configured cookie.
+// cookieHeaderValue returns the value to write into the header, and a non-empty
+// reason when there is none (the missing cookie policy then applies).
 //
-// A missing cookie is an expected case (the client is not authenticated yet,
-// the request is a health check, an asset, ...): the header is simply not set.
-// Reporting it at the warn level on every request floods the logs of a service
-// whose requests do not all carry the cookie, hence:
-//
-//   - the detail goes to the debug level, throttled like the other messages
-//     (logLevel: debug shows it);
-//   - a single warning is emitted per middleware instance, so that a wrong
-//     cookieName stays visible at the warn level without flooding the log.
-func (ce *CookieExtract) logMissingCookie() {
-	ce.missingCookieWarned.Do(func() {
-		ce.logger.warnf("no %q cookie in the request", ce.cookieName)
-	})
+// A missing cookie, an absent field, an empty value and a value carrying control
+// characters are all "no value": they are the cases the policy exists for.
+func (ce *CookieExtract) cookieHeaderValue(req *http.Request) (string, string) {
+	cookie, err := req.Cookie(ce.cookieName)
+	if err != nil {
+		return "", fmt.Sprintf("no %q cookie in the request", ce.cookieName)
+	}
 
-	ce.logger.debugf("no %q cookie in the request", ce.cookieName)
+	value := cookie.Value
+	if ce.cookieField != "" {
+		// A JSON payload cannot be sent raw inside a cookie (the quotes are not
+		// valid in a cookie value, and Go drops such a cookie): the raw value is
+		// tried first, then the percent-decoded one.
+		field, ok := jsonField(value, ce.cookieField)
+		if !ok {
+			if decoded, decodeErr := url.QueryUnescape(value); decodeErr == nil {
+				field, ok = jsonField(decoded, ce.cookieField)
+			}
+		}
+		if !ok {
+			return "", fmt.Sprintf("no %q field in the %q cookie", ce.cookieField, ce.cookieName)
+		}
+
+		value = field
+	}
+
+	if value == "" {
+		return "", fmt.Sprintf("the %q cookie is empty", ce.cookieName)
+	}
+
+	if hasControlChars(value) {
+		return "", fmt.Sprintf("the %q cookie carries control characters", ce.cookieName)
+	}
+
+	return value, ""
+}
+
+// handleMissingValue applies the configured missingCookiePolicy.
+//
+// A request without the cookie is an expected case (the client is not
+// authenticated yet, the request is a health check, an asset, ...), which is why
+// the detail is reported at the debug level and the warning once per middleware
+// instance: reporting it at the warn level on every request floods the logs of a
+// service whose requests do not all carry the cookie.
+func (ce *CookieExtract) handleMissingValue(rw http.ResponseWriter, req *http.Request, reason string) {
+	switch ce.missingPolicy {
+	case MissingCookieDeny:
+		// Every rejection is reported (the logger throttles the message).
+		ce.logger.warnf("rejecting the request: %s", reason)
+		http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+
+	case MissingCookieStrip:
+		// A client-supplied header of the same name must not reach the backend.
+		ce.missingCookieWarned.Do(func() { ce.logger.warnf("%s", reason) })
+		ce.logger.debugf("%s; the %s header was removed", reason, ce.headerName)
+		req.Header.Del(ce.headerName)
+		ce.next.ServeHTTP(rw, req)
+
+	default:
+		ce.missingCookieWarned.Do(func() { ce.logger.warnf("%s", reason) })
+		ce.logger.debugf("%s; the %s header is left untouched", reason, ce.headerName)
+		ce.next.ServeHTTP(rw, req)
+	}
 }
 
 // validate checks the configuration, so that mistakes are reported when the
@@ -163,7 +249,31 @@ func (c *Config) validate() error {
 		return errors.New("headerNameForCookieValue must not be empty")
 	}
 
+	if c.CookieField != "" {
+		if err := validateFieldPath("cookieField", c.CookieField); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// parseMissingCookiePolicy maps the missingCookiePolicy configuration value to
+// one of the accepted policies. An empty value means the default (keep).
+// It is called by the constructor, so that an unsupported policy fails the
+// middleware creation with the list of the accepted values.
+func parseMissingCookiePolicy(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", MissingCookieKeep:
+		return MissingCookieKeep, nil
+	case MissingCookieStrip:
+		return MissingCookieStrip, nil
+	case MissingCookieDeny:
+		return MissingCookieDeny, nil
+	default:
+		return "", fmt.Errorf("unsupported missingCookiePolicy %q, expected one of: %s, %s, %s",
+			value, MissingCookieKeep, MissingCookieStrip, MissingCookieDeny)
+	}
 }
 
 // validateCookieName rejects the names that can never match a cookie: reading a

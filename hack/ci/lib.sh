@@ -78,7 +78,18 @@ compose() { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"; }
 prepare_plugin() {
     rm -rf "${PLUGIN_DIR}"
     mkdir -p "${PLUGIN_DIR}"
-    cp "${ROOT_DIR}/.traefik.yml" "${ROOT_DIR}/go.mod" "${ROOT_DIR}"/cookieextract.go "${ROOT_DIR}"/logger.go "${PLUGIN_DIR}/"
+    cp "${ROOT_DIR}/.traefik.yml" "${ROOT_DIR}/go.mod" "${PLUGIN_DIR}/"
+
+    # Every runtime source (the test files are not part of the plugin package):
+    # the copy is explicit so that the stand proves the plugin needs nothing but
+    # the Go standard library, and a glob so that a new file is never forgotten.
+    local f
+    for f in "${ROOT_DIR}"/*.go; do
+        case "${f}" in
+        *_test.go) continue ;;
+        esac
+        cp "${f}" "${PLUGIN_DIR}/"
+    done
 }
 
 stand_up() {

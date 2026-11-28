@@ -1,8 +1,19 @@
 # Changelog
 
-## 1.1.0 (unreleased)
+## 1.1.0 (2026-11-27)
 
 ### Added
+
+* `cookieField`: write the field of a JSON cookie value into the header instead
+  of the whole value (dot paths, array indexes, scalars, percent-encoded
+  payloads);
+* `missingCookiePolicy`: `keep` (default), `strip` or `deny` — `strip` removes
+  the target header so that a client cannot smuggle its own value past the
+  middleware, `deny` answers `401` before the backend is called;
+* fuzz tests for the field extraction and for the header value
+  (`make fuzz`, `go test -fuzz`), and the `checkCookieFieldAndPolicies` case of
+  `make yaegi-check` (the JSON and URL helpers run inside the interpreter);
+
 
 * the docker stands of the nightly pipeline: `hack/ci/integration.sh` (log
   routing and levels, spoofing, JSON cookie, hostile values, reload, invalid
@@ -15,6 +26,19 @@
 * the load stand measures the property this plugin was written for: thousands of
   requests without the cookie produce a handful of log lines (throttling and one
   warning per middleware instance), instead of one warning per request.
+
+### Changed
+
+* an empty cookie value is handled like a missing cookie (previously it wrote the
+  bare prefix, e.g. `Authorization: Bearer `);
+* a value carrying control characters is never written into a header (a field
+  decoded from a JSON payload can contain an escaped newline).
+
+### Fixed
+
+* with `missingCookiePolicy: strip` or `deny`, a request without the cookie can
+  no longer forward a client-supplied header of the same name (the reason the
+  policies were added: see the Security section of the README).
 
 ## 1.0.0 (2026-11-26)
 

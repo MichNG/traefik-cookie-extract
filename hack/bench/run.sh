@@ -147,7 +147,16 @@ prepare_scratch() {
 
     # Only the runtime sources are copied: the mount stays small and the stand
     # then also proves that the plugin needs nothing but the Go standard library.
-    cp "${ROOT}/.traefik.yml" "${ROOT}/go.mod" "${ROOT}/cookieextract.go" "${ROOT}/logger.go" "${PLUGIN_DIR}/"
+    cp "${ROOT}/.traefik.yml" "${ROOT}/go.mod" "${PLUGIN_DIR}/"
+
+    # Every runtime source (the test files are not part of the plugin package).
+    local f
+    for f in "${ROOT}"/*.go; do
+        case "${f}" in
+        *_test.go) continue ;;
+        esac
+        cp "${f}" "${PLUGIN_DIR}/"
+    done
 
     : >"${TRACEFILE}"
     log "bench: plugin runtime sources copied to ${PLUGIN_DIR}"
